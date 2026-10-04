@@ -16,7 +16,7 @@ import asyncio
 import datetime
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .config import RUNS
 from .data import CATEGORIES, tickets
@@ -45,6 +45,21 @@ THINKING = {"thinking": {"type": "enabled", "budget_tokens": 1024}}
 # Обращений в день для прогноза на месяц
 FLOW_PER_DAY = 50_000
 
+# Разобранные обращения на границах категорий. Примеры придуманы для задания
+# и не встречаются в data/tickets.jsonl.
+EXAMPLES = [
+    (
+        "Клиент не может завершить покупку: банк не присылает одноразовый "
+        "код подтверждения для оплаты иностранной картой.",
+        "платежи",
+    ),
+    (
+        "Магазин уже перечислил покупателю возврат, но подтверждающая "
+        "квитанция в кабинете так и не появилась.",
+        "возвраты",
+    ),
+]
+
 
 @dataclass
 class Candidate:
@@ -52,12 +67,14 @@ class Candidate:
     system: str
     body: Dict[str, Any] = field(default_factory=dict)  # добавка к запросу
     max_tokens: int = 16
+    examples: List[Tuple[str, str]] = field(default_factory=list)
 
 
 CANDIDATES = [
     Candidate("короткая постановка", SHORT),
     Candidate("постановка с правилами", DETAILED),
     Candidate("правила + рассуждение", DETAILED, body=THINKING, max_tokens=2048),
+    Candidate("правила + примеры", DETAILED, examples=EXAMPLES),
 ]
 
 
@@ -72,14 +89,22 @@ class Row:
     latency_s: float = 0.0
     ttft_s: Optional[float] = None
     usage: Usage = field(default_factory=Usage)
+    expected: Optional[str] = None
+    predicted: Optional[str] = None
+    text: str = ""
 
 
 def prompt(cand: Candidate, row: Dict[str, Any]) -> List[Dict[str, str]]:
-    """Постановка кандидата и текст обращения"""
-    return [
-        {"role": "system", "content": cand.system},
-        {"role": "user", "content": row["text"]},
-    ]
+    """Постановка кандидата, разобранные примеры и текст обращения"""
+    messages = [{"role": "system", "content": cand.system}]
+    for text, answer in cand.examples:
+        messages.extend(
+            [
+                {"role": "user", "content": text},
+                {"role": "assistant", "content": answer},
+            ]
+        )
+    return messages + [{"role": "user", "content": row["text"]}]
 
 
 def parse_category(text: str) -> Optional[str]:
@@ -110,16 +135,27 @@ async def run_candidate(
     gate = asyncio.Semaphore(concurrency)
 
     async def one(row: Dict[str, Any]) -> Row:
+        expected = row["gold"]["category"]
         async with gate:
             try:
                 res = await client.astream(
                     prompt(cand, row), max_tokens=cand.max_tokens
                 )
             except LLMError:
-                return Row(row["id"], ok=False, failed=True)
+                return Row(
+                    row["id"],
+                    ok=False,
+                    expected=expected,
+                    text=row["text"],
+                    failed=True,
+                )
+        predicted = parse_category(res.text)
         return Row(
             row["id"],
-            parse_category(res.text) == row["gold"]["category"],
+            predicted == expected,
+            expected=expected,
+            predicted=predicted,
+            text=row["text"],
             truncated=res.truncated,
             latency_s=res.total_s,
             ttft_s=res.ttft_s,
@@ -150,6 +186,9 @@ def summarize(
         "p95, с": percentile(latencies, 0.95),
         "первый токен p50, с": percentile(ttfts, 0.5),
         "токенов на обращение": per(total.total_tokens),
+        "входных на обращение": per(
+            total.input_tokens + total.cache_read_tokens + total.cache_write_tokens
+        ),
         "взвешенных на обращение": per(total.weighted),
         "цена за 1000, у.е.": 1000 * per(total.cost),
         "взвешенных в месяц, млн": per(total.weighted) * flow_per_day * 30 / 1e6,
@@ -165,6 +204,30 @@ def table(rows: List[Dict[str, Any]]) -> str:
     fmt = lambda v: ("%.3f" % v if isinstance(v, float) else str(v))
     lines = ["| " + " | ".join(heads) + " |", "|" + "---|" * len(heads)]
     lines += ["| " + " | ".join(fmt(r[h]) for h in heads) + " |" for r in rows]
+    return "\n".join(lines)
+
+
+def error_report(name: str, rows: List[Row]) -> str:
+    """Ошибки кандидата с эталоном, ответом модели и текстом обращения"""
+    errors = [row for row in rows if not row.ok]
+    count = len(errors)
+    word = "ошибка" if count == 1 else "ошибки" if 2 <= count <= 4 else "ошибок"
+    lines = ["### %s: %d %s из %d" % (name, count, word, len(rows))]
+    if not errors:
+        return lines[0] + "\n\nОшибок нет."
+
+    lines += [
+        "",
+        "| обращение | эталон | ответ | текст |",
+        "|---|---|---|---|",
+    ]
+    for row in errors:
+        predicted = "сбой" if row.failed else row.predicted or "не распознано"
+        text = row.text.replace("|", "\\|").replace("\n", " ")
+        lines.append(
+            "| %s | %s | %s | %s |"
+            % (row.id, row.expected or "—", predicted, text)
+        )
     return "\n".join(lines)
 
 
@@ -189,10 +252,11 @@ def main() -> None:
             await run_candidate(llm, cand, rows, args.concurrency) for cand in chosen
         ]
 
-    results, spent = [], 0.0
+    results, diagnostics, spent = [], [], 0.0
     for cand, done in zip(chosen, asyncio.run(run_all())):
         spent += sum(r.usage.weighted for r in done)
         results.append(summarize(cand.name, done, args.flow))
+        diagnostics.append(error_report(cand.name, done))
     report = table(results)
     print(report)
     footer = (
@@ -201,10 +265,14 @@ def main() -> None:
         % (llm.cfg.model, len(rows), args.flow, time.time() - started, spent)
     )
     print(footer)
+    errors = "## Разбор ошибок\n\n" + "\n\n".join(diagnostics)
+    print("\n" + errors)
     RUNS.mkdir(parents=True, exist_ok=True)
     stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     (RUNS / "s1_bench.md").write_text(
-        "# Замер кандидатов, %s\n\n%s\n%s\n" % (stamp, report, footer), encoding="utf-8"
+        "# Замер кандидатов, %s\n\n%s\n%s\n\n%s\n"
+        % (stamp, report, footer, errors),
+        encoding="utf-8",
     )
 
 
